@@ -1,113 +1,100 @@
 # 実装方針（MASAKI OS）
 
-## 1. 技術構成
+## 1. 構成の考え方（前回から根本変更）
 
-| 分類 | 採用 | 補足 |
+自前アプリ（Next.js/Supabase/Vercel）は作らない。**Claude（この環境）を実行主体**とし、既に接続済みのコネクタを操作して業務を回す。
+
+```
+         ┌─────────────────────────────────────────────┐
+         │                Claude（実行主体）              │
+         │  ・コネクタ操作  ・議事録生成  ・タスク抽出      │
+         └───────┬─────────────┬─────────────┬───────────┘
+                 │             │             │
+           tl;dv コネクタ   Notion コネクタ  Google Drive コネクタ
+           （会議取得）     （DB＋ビュー）   （ファイル・任意）
+```
+
+- **LLM は Claude 自身**（セッションのモデル）。別途 API キー不要。
+- **データベース＝ Notion**、**ダッシュボード＝ Notion のビュー**。
+- **追加のサーバー・キー・課金なし。**
+
+## 2. 全体データフロー（初回縦串）
+
+```
+tl;dv（録画・文字起こし）
+  → Claude が search-meetings で新規会議を検出（tldv_id で冪等）
+  → Notion「Meetings」に登録／更新
+  → Claude が get-meeting-transcript で全文取得
+  → Claude が議事録を生成（目標フォーマット）
+  → Notion「Meetings」ページ本文に議事録を記載（必要なら Drive にも保存）
+  → Claude が決定事項・タスク・確認待ちを抽出
+  → Notion「Decisions / Tasks / Confirmations」に status=draft で登録
+  → 自分が Notion で確認し「確定（confirmed）」に変更
+  → （Phase2）確定後のみ、依頼・リマインド等の連携を有効化
+```
+
+## 3. 実行モデル（どこで動くか）
+
+| フェーズ | 起動方法 | コネクタの可用性 |
 |---|---|---|
-| 開発 | Claude Code | 設計・実装・改修担当 |
-| フロントエンド / API | Next.js（App Router, TypeScript） | 画面と API Route を同居 |
-| デプロイ | Vercel | Web + Cron |
-| DB | Supabase（PostgreSQL） | RLS 有効化 |
-| 認証 | Google OAuth（Supabase Auth 経由） | allowlist で自分のみ許可 |
-| ファイル保存 | Google Drive / Google Docs | 議事録・資料・成果物 |
-| 会議 | tl;dv API | メタデータ・議事録・文字起こし取得 |
-| AI処理 | Claude API（既定） | 議事録生成・抽出。OpenAI も差し替え可能に抽象化 |
-| 定期実行 | Vercel Cron | 会議ポーリング・リマインド・レポート |
-| ソース管理 | GitHub（本リポジトリ） | |
-| エラー監視 | Sentry（Phase 2 で導入検討） | |
-| グラフ | Recharts（KPI導入時） | Phase 2 |
+| Phase 1（半自動） | Claude Code Web/アプリで対話的に「取り込んで」と指示 | 対話セッションなので利用可 |
+| Phase 2（定期自動・要検証） | 定期セッション（Routine/cron）で自動起動 | **対話認証のコネクタが無人実行で使えるか要検証**。使えなければ半自動を継続 |
 
-### 重要な前提：連携はアプリが自前の資格情報を持つ
+> 注：ヘッドレス/無人実行では対話認証済み MCP コネクタが利用できない場合がある。Phase 2 導入前に必ず小さく検証する。
 
-このリポジトリで開発する Next.js アプリは、Claude Code セッションの MCP 連携（tl;dv/Notion/Drive 等）を利用できない。
-**デプロイするアプリは各サービスの API キー / OAuth を自前で保持する。** 必要な資格情報は §5。
+## 4. 自動化の3区分（ポリシー）
 
-## 2. 全体データフロー
+処理は必ず次のいずれかに分類する（Notion の Tasks/Automations で管理）。
 
-```
-tl;dv（録画・文字起こし・AI議事録）
-  → [Cron] 新規会議をポーリング取得
-  → meetings / meeting_participants に登録
-  → [AI] 文字起こしから議事録を生成（目標フォーマット）
-  → Google Drive / Docs に保存（artifacts にリンク登録）
-  → [AI] 決定事項・タスク・確認待ちを抽出
-  → decisions / action_items / confirmations に登録（要確認フラグつき）
-  → ダッシュボードで表示・確認・確定
-  → [Cron] 期限・確認待ちをリマインド（Gmail / Calendar）
-```
+### 自動（auto）
+会議取り込み / 議事録の下書き生成 / タスク・決定・確認待ちの抽出（＝下書き登録） / 数値集計 / 実行ログ記録
 
-AI作業履歴の流れ（F9）：
+### 承認後（approval_required）
+外部向けメール送信 / 依頼の送付 / 公開資料の更新 / 会員情報の変更 / 数値データの確定 / リマインド送信
 
-```
-ChatGPT / Claude / Claude Code 等での作業
-  → ダッシュボードから簡易登録（作業名＋成果物URL）／Claude Code は Hooks で送信
-  → ai_work_logs に記録し、プロジェクト・成果物に紐付け
-  → 後から検索・再利用
-```
+### 手動（manual_only）
+契約・コンプライアンス判断 / 会員ランク・権限の重要変更 / 報酬確定 / 外部公開前の最終承認 / 個人情報の削除
 
-## 3. 自動化の3区分（最重要ポリシー）
+> 抽出物は初期状態を「下書き（draft）」とし、自分が「確定（confirmed）」にするまで外部連携は起こさない。
 
-処理は必ず次のいずれかに分類し、DBの `automations.mode` で管理する。
+## 5. セキュリティ・機密情報の扱い
 
-### 自動実行（auto）
-議事録の下書き生成 / Drive格納 / タスク候補抽出 / 定期データ取得 / 数値集計 / リマインド / 週次レポート下書き / ファイル・フォルダ整理
-
-### 承認後に実行（approval_required）
-外部向けメール送信 / LINE配信 / タスク担当者への依頼送付 / 公開資料の更新 / 会員情報の変更 / 数値データの確定
-
-### 必ず手動（manual_only）
-契約・コンプライアンス判断 / 会員ランク・権限の重要変更 / 報酬確定 / 外部公開前の最終承認 / 個人情報を含むデータの削除
-
-> 抽出された議事録・タスク・決定事項は、初期状態を「下書き/未確認（draft）」とし、
-> 自分が確認して「確定（confirmed）」に変えるまで外部連携（依頼送付・メール等）は起こさない。
-
-## 4. 認証・認可
-
-- Supabase Auth の Google プロバイダを使用。
-- ログイン許可は allowlist（`m.sato@holyday.co.jp`）。それ以外は拒否。
-- Supabase の RLS を全テーブルで有効化。当面は「許可ユーザーのみ全行アクセス可」の単純ポリシーから開始し、マルチユーザー化時に owner ベースへ拡張する。
-
-## 5. 必要な資格情報（要準備）
-
-| # | 資格情報 | 用途 | 保管 |
-|---|---|---|---|
-| 1 | Claude API キー | 議事録生成・抽出 | Vercel 環境変数 / Supabase Vault |
-| 2 | tl;dv API キー | 会議取得 | 同上。要：tl;dvプランでのAPI利用可否確認 |
-| 3 | Google Cloud OAuth クライアント（ID/Secret） | Drive保存・Googleログイン | 同上 |
-| 4 | Supabase プロジェクト（URL / anon / service_role） | DB | 同上。service_role はサーバー側のみ |
-| 5 | Vercel プロジェクト | デプロイ・Cron | — |
-
-シークレットはコミットしない。`.env.local`（ローカル）と Vercel 環境変数で管理し、`.env.example` に項目のみ記載する。
-
-## 6. セキュリティ・機密情報の扱い
-
-会議文字起こし・CS・会員情報は機密性が高い。以下を定義・順守する。
+会議文字起こし・CS・会員情報は機密。以下を順守する。
 
 | 観点 | 方針 |
 |---|---|
-| 保存対象 | 議事録・決定・タスクは保存。文字起こし全文は必要範囲のみ保持し、原文はtl;dvリンク参照を基本とする |
-| 保存期間 | 機密度に応じて設定（後続で確定）。削除手順を用意 |
-| 閲覧権限 | 自分のみ。RLS＋allowlist |
-| AI送信範囲 | AIへ渡すのは要約・抽出に必要な範囲。個人情報の不要な送信を避ける |
-| 削除 | 個人情報削除は manual_only。削除は audit_logs に記録 |
-| 操作履歴 | 承認・確定・削除・外部送信を audit_logs に記録 |
-| 外部接続 | 接続先を tl;dv / Google / Claude に限定。最小権限のスコープのみ付与 |
+| 保存対象 | 議事録・決定・タスクを Notion に保存。文字起こし全文は Notion に丸ごと残さず、必要範囲の要約＋ tl;dv リンク参照を基本 |
+| AI送信範囲 | Claude に渡すのは生成・抽出に必要な範囲のみ。不要な個人情報を広げない |
+| 閲覧権限 | Notion スペースは自分のみ。共有範囲を最小化 |
+| 削除 | 個人情報削除は manual_only |
+| 操作履歴 | 取り込み・確定・削除は Notion 側履歴／実行ログで追跡 |
+| 接続先 | tl;dv / Notion / Google Drive に限定。最小権限 |
 
-## 7. リポジトリ構成（予定）
+## 6. 費用
+
+追加課金ゼロ。利用するのはすべて既存のもの（tl;dv / Notion / Google Drive / Claude / GitHub）。
+
+- Claude の利用は既存プランの範囲。大量処理時はプランの利用上限に留意する（新たな課金ではない）。
+
+## 7. このリポジトリの役割
+
+自前アプリのコードは持たない。以下を “正” として管理する。
 
 ```
-/                     … Next.js アプリ（App Router）
-  app/                … 画面・API Route
-  lib/
-    integrations/     … tl;dv / drive / claude のクライアント（差し替え可能な抽象化）
-    db/               … Supabase クライアント・型
-  supabase/
-    migrations/       … SQL マイグレーション
-docs/                 … 本ドキュメント群
+docs/
+  requirements.md              … 要件定義
+  architecture.md              … 実装方針（本書）
+  notion-data-model.md         … Notion データベース設計
+  slice-01-meeting-to-tasks.md … 初回縦串の詳細仕様
+  samples/                     … ゴールデンサンプル（期待出力の基準）
+  runbook.md                   … 運用手順（Phase1構築後に追加）
 ```
 
-## 8. 環境と実行
+将来、会議取り込み〜抽出の手順を **Claude スキル**（`.claude/skills/`）として実装し、「取り込んで」の一言で再現できるようにする。
 
-- ローカル：`.env.local` に §5 の値を設定して `next dev`。
-- 定期処理：Vercel Cron が API Route（例 `/api/cron/poll-meetings`）を叩く。Cron エンドポイントは秘密トークンで保護。
-- すべての Cron 実行は `automation_runs` に開始/終了/結果/コストを記録する。
+## 8. 構築ステップ（Phase 1）
+
+1. Notion に MASAKI OS 用のデータベース群を作成（notion-data-model.md）。
+2. 初回縦串を1件の実会議で手動実行し、Notion へ登録（slice-01）。
+3. 手順を安定化し、再現用のスキル／ランブックに落とす。
+4. 半自動運用を回しながら、Phase 2（定期自動）の可否を検証。
